@@ -5,6 +5,8 @@ __pycache__/
 *$py.class
 *.so
 .Python
+chroma_db/*
+uploaded_documents/*
 
 .venv/
 

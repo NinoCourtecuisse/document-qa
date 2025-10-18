@@ -16,7 +16,8 @@ embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
 #llm = Ollama(model="llama3.2", request_timeout=120.0)
 llm = HuggingFaceInferenceAPI(
     model_name="meta-llama/Meta-Llama-3-8B-Instruct",
-    provider="auto"
+    provider="auto",
+    timeout=60
 )
 
 chroma_client = chromadb.EphemeralClient()
