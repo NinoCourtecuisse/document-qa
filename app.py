@@ -6,6 +6,8 @@ from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
+from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.postprocessor import SimilarityPostprocessor
 from src.pdf_parser import ReaderType, PDFReaderFactory
 import shutil
 from pathlib import Path
@@ -44,6 +46,17 @@ llm = HuggingFaceInferenceAPI(
 
 # PDF parsers
 pdf_reader_factory = PDFReaderFactory()
+
+# Single chat memory for all conversations
+chat_memory = ChatMemoryBuffer.from_defaults(
+    token_limit=3000
+)
+
+# Similarity threshold for filtering retrieved nodes
+SIMILARITY_THRESHOLD = 0.5
+similarity_postprocessor = SimilarityPostprocessor(
+    similarity_cutoff=SIMILARITY_THRESHOLD
+)
 
 class QueryRequest(BaseModel):
     question: str
@@ -144,7 +157,9 @@ def list_documents():
 @app.post("/query")
 def query_documents(request: QueryRequest):
     """
-    Query the documents and return answer with citations
+    Query the documents and return answer with citations.
+    Maintains conversation history across all queries.
+    Filters results using similarity threshold to improve answer quality.
     """
     try:
         index = VectorStoreIndex.from_vector_store(
@@ -152,13 +167,17 @@ def query_documents(request: QueryRequest):
             embed_model=embed_model
         )
 
-        query_engine = index.as_query_engine(
+        # Use chat engine instead of query engine for memory support
+        chat_engine = index.as_chat_engine(
             llm=llm,
             similarity_top_k=3,
-            response_mode="compact"
+            chat_mode="context",  # Uses retrieved context + chat history
+            memory=chat_memory,
+            node_postprocessors=[similarity_postprocessor],
+            system_prompt="You are a helpful AI assistant that answers questions based on the provided documents. Use the context from the documents to provide accurate answers. Provide concise answers."
         )
 
-        response = query_engine.query(request.question)
+        response = chat_engine.chat(request.question)
 
         # Extract source information
         sources = []
@@ -169,20 +188,41 @@ def query_documents(request: QueryRequest):
                 "score": node.score
             })
 
+        # Check if no sources passed the similarity threshold
+        if len(sources) == 0:
+            return {
+                "answer": "I couldn't find any relevant information in the documents to answer your question. This could mean the question is not related to the uploaded documents.",
+                "sources": sources,
+                "sources_count": 0,
+                "warning": "No sources met the similarity threshold"
+            }
+
         return {
             "answer": str(response),
-            "sources": sources
+            "sources": sources,
+            "sources_count": len(sources)
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error querying documents: {str(e)}")
 
+@app.delete("/chat")
+def clear_chat_history():
+    """
+    Clear chat conversation history
+    """
+    global chat_memory
+    chat_memory = ChatMemoryBuffer.from_defaults(
+        token_limit=3000
+    )
+    return {"message": "Chat history cleared successfully"}
+
 @app.delete("/clear")
 def clear_database():
     """
-    Clear the vector database and delete all uploaded files
+    Clear the vector database, delete all uploaded files, and clear chat history
     """
-    global chroma_collection, vector_store, storage_context
+    global chroma_collection, vector_store, storage_context, chat_memory
 
     try:
         collection_count = chroma_collection.count()
@@ -198,8 +238,13 @@ def clear_database():
                 file_path.unlink()
                 files_deleted += 1
 
+        # Clear chat history
+        chat_memory = ChatMemoryBuffer.from_defaults(
+            token_limit=3000
+        )
+
         return {
-            "message": "Database and files cleared successfully",
+            "message": "Database, files, and chat history cleared successfully",
             "vectors_cleared": collection_count,
             "files_deleted": files_deleted
         }
