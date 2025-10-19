@@ -1,15 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from enum import Enum
 import chromadb
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
-from llama_index.readers.docling import DoclingReader
-from llama_index.readers.file import PDFReader
-from llama_parse import LlamaParse
+from src.pdf_parser import ReaderType, PDFReaderFactory
 import shutil
 from pathlib import Path
 import uuid
@@ -31,11 +28,13 @@ app.add_middleware(
 UPLOAD_DIR = Path("uploaded_documents")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# Vector DB and LLamaIndex wrapper
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 chroma_collection = chroma_client.get_or_create_collection("documents")
 vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
+# AI models
 embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
 llm = HuggingFaceInferenceAPI(
     model_name="meta-llama/Meta-Llama-3-8B-Instruct",
@@ -43,14 +42,8 @@ llm = HuggingFaceInferenceAPI(
     timeout=60
 )
 
-pdf_reader = PDFReader()
-docling_reader = DoclingReader()
-llama_parse_reader = LlamaParse()
-
-class ReaderType(str, Enum):
-    PDF_READER = "pdf_reader"
-    DOCLING = "docling"
-    LLAMA_PARSE = "llama_parse"
+# PDF parsers
+pdf_reader_factory = PDFReaderFactory()
 
 class QueryRequest(BaseModel):
     question: str
@@ -65,24 +58,8 @@ def list_readers():
     List available PDF readers
     """
     return {
-        "readers": [
-            {
-                "value": ReaderType.PDF_READER.value,
-                "name": "PDF Reader",
-                "description": "Basic PDF reader from LlamaIndex"
-            },
-            {
-                "value": ReaderType.DOCLING.value,
-                "name": "Docling",
-                "description": "Advanced PDF reader with layout preservation"
-            },
-            {
-                "value": ReaderType.LLAMA_PARSE.value,
-                "name": "LlamaParse",
-                "description": "LlamaIndex's premium parsing service"
-            }
-        ],
-        "default": ReaderType.DOCLING.value
+        "readers": pdf_reader_factory.get_all_readers_info(),
+        "default": pdf_reader_factory.get_default_reader()
     }
 
 @app.post("/upload")
@@ -109,15 +86,11 @@ async def upload_document(
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Select the appropriate reader based on the parameter
-        if reader == ReaderType.PDF_READER:
-            selected_reader = pdf_reader
-        elif reader == ReaderType.DOCLING:
-            selected_reader = docling_reader
-        elif reader == ReaderType.LLAMA_PARSE:
-            selected_reader = llama_parse_reader
-        else:
-            raise HTTPException(status_code=400, detail=f"Invalid reader type: {reader}")
+        # Get the appropriate reader from the factory
+        try:
+            selected_reader = pdf_reader_factory.get_reader(reader)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         documents = selected_reader.load_data(str(file_path))
         for doc in documents:
