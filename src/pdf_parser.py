@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from llama_index.readers.file import PDFReader
 from llama_index.readers.docling import DoclingReader
 from llama_parse import LlamaParse
+from llama_index.core.readers.base import BaseReader
 
 class ReaderType(str, Enum):
     PDF_READER = "pdf_reader"
@@ -47,7 +48,7 @@ class PDFReaderFactory:
             reader_instance=LlamaParse()
         )
 
-    def get_reader(self, reader_type: ReaderType | str) -> Any:
+    def get_reader(self, reader_type: ReaderType | str) -> BaseReader:
         key = reader_type.value if isinstance(reader_type, ReaderType) else reader_type
 
         if key not in self._readers:

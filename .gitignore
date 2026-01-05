@@ -7,6 +7,7 @@ __pycache__/
 .Python
 chroma_db/*
 uploaded_documents/*
+buffer/*
 
 .venv/
 

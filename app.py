@@ -1,18 +1,21 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+
 import chromadb
 from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.core.chat_engine.types import ChatMode
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.postprocessor import SimilarityPostprocessor
+
 from src.pdf_parser import ReaderType, PDFReaderFactory
-import shutil
+from src.file_manager import FileManager
+
 from pathlib import Path
-import uuid
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -27,11 +30,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = Path("uploaded_documents")
-UPLOAD_DIR.mkdir(exist_ok=True)
+CONTENT_DIR = Path("./uploaded_documents/content")
+NAME_FILE = Path("./uploaded_documents/names.pkl")
+HASH_FILE = Path("./uploaded_documents/hashes.pkl")
+file_manager = FileManager(persistent_path=CONTENT_DIR,
+                           file_names=NAME_FILE, file_hashes=HASH_FILE)
 
-# Vector DB and LLamaIndex wrapper
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
+VECTOR_DB_PATH = Path("./chroma_db")
+chroma_client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
 chroma_collection = chroma_client.get_or_create_collection("documents")
 vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 storage_context = StorageContext.from_defaults(vector_store=vector_store)
@@ -88,71 +94,54 @@ async def upload_document(
         reader: The reader to use for parsing (pdf_reader, docling, or llama_parse)
     """
     try:
-        file_extension = Path(file.filename).suffix.lower()
-        if file_extension != ".pdf":
-            raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
-        file_id = str(uuid.uuid4())
-        unique_filename = f"{file_id}_{file.filename}"
-        file_path = UPLOAD_DIR / unique_filename
-
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Get the appropriate reader from the factory
-        try:
-            selected_reader = pdf_reader_factory.get_reader(reader)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        documents = selected_reader.load_data(str(file_path))
-        for doc in documents:
-            doc.metadata["filename"] = file.filename
-            doc.metadata["file_id"] = file_id
-
-        # Get the count before indexing
-        count_before = chroma_collection.count()
-
-        index = VectorStoreIndex.from_documents(
-            documents,
-            storage_context=storage_context,
-            embed_model=embed_model,
-            show_progress=True
-        )
-
-        # Get the count after indexing to determine how many chunks were added
-        count_after = chroma_collection.count()
-        num_chunks = count_after - count_before
-
+        file_manager.add_to_buffer(file)
+        file_manager.validate_file(file.filename)
+    except HTTPException as e:
         return {
-            "message": "Document uploaded and processed successfully",
+            "success": False,
+            "message": e,
             "filename": file.filename,
-            "file_id": file_id,
-            "reader_used": reader.value,
-            "vectors_created": num_chunks
         }
+    file_manager.store(file)
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+    # Get the appropriate reader from the factory
+    try:
+        selected_reader = pdf_reader_factory.get_reader(reader)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    documents = selected_reader.load_data(str(CONTENT_DIR / file.filename)) # type: ignore
+    for doc in documents:
+        doc.metadata["filename"] = file.filename
+
+    # Get the count before indexing
+    count_before = chroma_collection.count()
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        storage_context=storage_context,
+        embed_model=embed_model,
+        show_progress=True
+    )
+
+    # Get the count after indexing to determine how many chunks were added
+    count_after = chroma_collection.count()
+    num_chunks = count_after - count_before
+
+    return {
+        "message": "Document uploaded and processed successfully",
+        "filename": file.filename,
+        "reader_used": reader.value,
+        "vectors_created": num_chunks,
+        "duplicate": False
+    }
 
 @app.get("/documents")
 def list_documents():
     """
     List all uploaded documents
     """
-    documents = []
-    for file_path in UPLOAD_DIR.glob("*"):
-        if file_path.is_file():
-            # Extract original filename (remove UUID prefix)
-            parts = file_path.name.split("_", 1)
-            if len(parts) == 2:
-                file_id, original_name = parts
-                documents.append({
-                    "file_id": file_id,
-                    "filename": original_name,
-                    "path": str(file_path)
-                })
-    return {"documents": documents}
+    return file_manager.list_documents()
 
 @app.post("/query")
 def query_documents(request: QueryRequest):
@@ -171,7 +160,7 @@ def query_documents(request: QueryRequest):
         chat_engine = index.as_chat_engine(
             llm=llm,
             similarity_top_k=3,
-            chat_mode="context",  # Uses retrieved context + chat history
+            chat_mode=ChatMode.CONTEXT,  # Uses retrieved context + chat history
             memory=chat_memory,
             node_postprocessors=[similarity_postprocessor],
             system_prompt="You are a helpful AI assistant that answers questions based on the provided documents. Use the context from the documents to provide accurate answers. Provide concise answers."
@@ -232,11 +221,7 @@ def clear_database():
         vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-        files_deleted = 0
-        for file_path in UPLOAD_DIR.glob("*"):
-            if file_path.is_file():
-                file_path.unlink()
-                files_deleted += 1
+        files_deleted = file_manager.clear_files()
 
         # Clear chat history
         chat_memory = ChatMemoryBuffer.from_defaults(
