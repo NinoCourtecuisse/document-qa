@@ -8,6 +8,7 @@ __pycache__/
 chroma_db/*
 uploaded_documents/*
 buffer/*
+journal.txt
 
 .venv/
 
